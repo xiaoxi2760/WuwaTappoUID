@@ -23,7 +23,7 @@ settings = StringConfig(
         "chest_task_hours": GsIntConfig(
             title="宝箱任务时长（小时）",
             desc="wt宝箱新建任务及每次续期增加的小时数，须为正整数；已有任务到期时间不变。",
-            data=24,
+            data=9999,
         ),
         "record_retention_days": GsIntConfig(
             title="原始记录保留天数",

@@ -1,0 +1,30 @@
+--- a/send_utils.py
++++ b/send_utils.py
+@@ -290,6 +290,7 @@
+     bot = cast("AiocqhttpAdapter", platform).get_client()
+     sid = int(session_id)
+     ids: list[str] = []
++    forward_sender: tuple[str, str] | None = None
+     temp_group_id = (
+         int(extra_group_id)
+         if (not is_group and extra_group_id.isdigit())
+@@ -333,6 +334,19 @@
+                             await _dispatch(messages)
+                             await asyncio.sleep(0.5)
+                     continue
++                if forward_sender is None:
++                    forward_sender = ("", "")
++                    try:
++                        login = await asyncio.wait_for(bot.call_action("get_login_info"), timeout=3)
++                        if isinstance(login, dict) and login.get("user_id"):
++                            uin = str(login["user_id"])
++                            forward_sender = (uin, str(login.get("nickname") or uin))
++                    except Exception as error:
++                        logger.warning(f"[GsCore] 合并转发读取机器人身份失败：{type(error).__name__}")
++                if forward_sender[0]:
++                    for node in seg.nodes:
++                        if not node.uin or node.uin == "0":
++                            node.uin, node.name = forward_sender
+                 payload = await seg.to_dict()
+                 if is_group:
+                     payload["group_id"] = session_id

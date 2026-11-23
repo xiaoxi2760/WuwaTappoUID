@@ -43,6 +43,7 @@ SERVICE_COMMANDS = (
     ("WuwaTappo次数", 6, ("次数", "增加次数")),
     ("WuwaTappo宝箱任务", 6, ("宝箱", "暂停", "恢复", "停止")),
     ("WuwaTappo开箱统计", 6, ("开箱统计",)),
+    ("WuwaTappo开箱监测", 6, ("监测",)),
     ("WuwaTappo通知订阅", 6, ("订阅", "取消订阅")),
     ("WuwaTappo资源更新", 6, ("更新资源",)),
     ("WuwaTappo强制资源更新", 1, ("强制更新资源",)),
@@ -154,6 +155,8 @@ async def _execute_command(bot: Bot, event: Event, request_scope: AsyncExitStack
             replies = await service.redeem(event, argument)
         elif command == "开箱统计":
             replies = await service.chest_statistics(event, StatisticsPeriod.parse(argument))
+        elif command == "监测":
+            replies = [await service.monitor_command(event, argument)]
         elif command == "背包":
             replies = await service.query(event, bag=True, filters=BagFilter.parse(argument))
         elif command == "图鉴":

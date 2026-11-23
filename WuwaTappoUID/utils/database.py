@@ -173,6 +173,24 @@ class ChestRecord(SQLModel, table=True):
     archive_error: str = Field(default="", sa_column=Column(String(160), nullable=False, server_default=""))
 
 
+class Monitor(SQLModel, table=True):
+    """每个用户一份开箱监测；只读取已落库的成功流水，不轮询上游。"""
+
+    __tablename__ = "wt_monitor"
+    __table_args__ = (Index("ix_wt_monitor_due", "enabled", "checked_at"), {"extend_existing": True})
+    owner_id: str = Field(primary_key=True, max_length=64)
+    account_id: str = Field(index=True, max_length=64)
+    subscription_id: int = Field(index=True)
+    role_ids: str = Field(default="[]", sa_column=Column(Text, nullable=False))
+    role_name: str = Field(default="", max_length=64)
+    enabled: bool = True
+    last_at: float = 0
+    checked_at: float = 0
+    last_report_at: float = 0
+    created_at: float = Field(default_factory=time.time)
+    updated_at: float = Field(default_factory=time.time)
+
+
 class Notice(SQLModel, table=True):
     __tablename__ = "wt_notice"
     __table_args__ = (
@@ -290,6 +308,7 @@ PLUGIN_TABLE_NAMES = (
     "wt_chest_task",
     "wt_chest_record",
     "wt_chest_summary",
+    "wt_monitor",
     "wt_notice",
     "wt_synthesis_record",
 )
@@ -546,6 +565,9 @@ class Store:
                 await session.delete(binding)
             else:
                 binding.account_id = replacement
+        monitor = await session.get(Monitor, owner_id)
+        if monitor is not None and monitor.account_id == account_id:
+            await session.delete(monitor)
         await session.flush()
         links = await session.scalar(
             select(func.count()).select_from(AccountLink).where(col(AccountLink.account_id) == account_id)
@@ -651,6 +673,103 @@ class Store:
             .order_by(col(ChestRecord.created_at), col(ChestRecord.id))
         )
         return list(result.scalars().all())
+
+    @classmethod
+    @with_read_session
+    async def monitor(cls, session: AsyncSession, owner_id: str) -> Monitor | None:
+        return await session.get(Monitor, owner_id)
+
+    @classmethod
+    @with_read_session
+    async def due_monitors(cls, session: AsyncSession, deadline: float) -> list[Monitor]:
+        result = await session.execute(
+            select(Monitor)
+            .where(col(Monitor.enabled).is_(True), col(Monitor.checked_at) <= deadline)
+            .order_by(col(Monitor.checked_at), col(Monitor.owner_id))
+        )
+        return list(result.scalars().all())
+
+    @classmethod
+    @with_read_session
+    async def monitor_records(
+        cls, session: AsyncSession, account_id: str, since: float, until: float
+    ) -> list[ChestRecord]:
+        # 只读已持久化的成功流水；不读取背包，也不调用游戏接口。
+        result = await session.execute(
+            select(ChestRecord)
+            .where(
+                col(ChestRecord.account_id) == account_id,
+                col(ChestRecord.state) == "success",
+                col(ChestRecord.created_at) > since,
+                col(ChestRecord.created_at) <= until,
+            )
+            .order_by(col(ChestRecord.created_at), col(ChestRecord.id))
+        )
+        return list(result.scalars().all())
+
+    @classmethod
+    @timed("database-write", slow=2)
+    @with_session
+    async def finish_monitor_window(
+        cls,
+        session: AsyncSession,
+        owner_id: str,
+        account_id: str,
+        expected_last_at: float,
+        text: str | None,
+        stamp: float,
+    ) -> bool:
+        """同一事务写入汇报通知并推进游标；游标未推进时不重复生成同一批汇报。"""
+        row = await session.get(Monitor, owner_id)
+        if row is None or not row.enabled or row.account_id != account_id:
+            return False
+        if abs(row.last_at - expected_last_at) > 1e-6:
+            return False
+        values: dict[str, float] = {"last_at": stamp, "checked_at": stamp, "updated_at": stamp}
+        if text:
+            values["last_report_at"] = stamp
+        result = await session.execute(
+            update(Monitor)
+            .where(
+                Monitor.owner_id == owner_id,
+                Monitor.enabled.is_(True),
+                Monitor.account_id == account_id,
+                Monitor.subscription_id == row.subscription_id,
+                Monitor.last_at == expected_last_at,
+            )
+            .values(**values)
+            .execution_options(synchronize_session=False)
+        )
+        if not isinstance(result, CursorResult):
+            raise TypeError("监测汇报更新没有返回数据库写入结果")
+        if result.rowcount != 1:
+            return False
+        if text:
+            session.add(Notice(subscription_id=row.subscription_id, account_id=account_id, text=text))
+        return True
+
+    @classmethod
+    @timed("database-write", slow=2)
+    @with_session
+    async def disable_monitor(cls, session: AsyncSession, owner_id: str, now: float) -> bool:
+        row = await session.get(Monitor, owner_id)
+        if row is None or not row.enabled:
+            return False
+        result = await session.execute(
+            select(Notice).where(
+                Notice.subscription_id == row.subscription_id,
+                Notice.delivery_state == "pending",
+            )
+        )
+        for notice in result.scalars().all():
+            notice.delivery_state = "superseded"
+            notice.finished_at = now
+            notice.last_error = "监测已关闭"
+            session.add(notice)
+        row.enabled = False
+        row.updated_at = now
+        session.add(row)
+        return True
 
     @classmethod
     @with_read_session
@@ -935,11 +1054,11 @@ class Store:
         references = or_(
             *(
                 select(model.subscription_id).where(model.subscription_id == Subscribe.id).correlate(Subscribe).exists()
-                for model in (ChestTask, ChestRecord, Notice, LoginSession)
+                for model in (ChestTask, ChestRecord, Notice, LoginSession, Monitor)
             )
         )
         query = select(Subscribe.id).where(
-            col(Subscribe.task_name).in_(["WuwaTappo宝箱", "WuwaTappo登录"]), ~references
+            col(Subscribe.task_name).in_(["WuwaTappo宝箱", "WuwaTappo登录", "WuwaTappo监测"]), ~references
         )
         if subscription_ids is not None:
             query = query.where(col(Subscribe.id).in_(subscription_ids))

@@ -24,7 +24,7 @@ def normalize(name: str) -> str:
     return unicodedata.normalize("NFKC", name).strip().casefold()
 
 
-def resolve_roles(name: str, roles: dict[str, str]) -> set[str]:
+def resolve_roles(name: str, roles: dict[str, str], command: str = "背包") -> set[str]:
     exact = {str(key) for key, value in roles.items() if value == name}
     if exact:
         return exact
@@ -37,7 +37,7 @@ def resolve_roles(name: str, roles: dict[str, str]) -> set[str]:
         return {alias}
     candidates = difflib.get_close_matches(normalized, sorted({normalize(value) for value in roles.values()}), n=3)
     suggestions = [next(value for value in roles.values() if normalize(value) == candidate) for candidate in candidates]
-    commands = "\n".join(command_text("背包", f"角色={candidate}") for candidate in suggestions)
+    commands = "\n".join(command_text(command, f"角色={candidate}") for candidate in suggestions)
     raise WuwaError(
         "未找到指定角色。" + ("你可能想查询：\n" + commands if commands else "请使用完整角色名，例如 角色=今汐。")
     )

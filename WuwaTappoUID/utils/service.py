@@ -20,12 +20,23 @@ from gsuid_core.utils.database.write_gate import WriteGateTimeout
 from pydantic import BaseModel, JsonValue, ValidationError
 from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 
-from . import notifications, synthesis_service
+from . import monitor, notifications, synthesis_service
 from .api import WuwaAPI, with_read_cache
 from .backpack import BagFilter
 from .cards import Cards, ResultContext
 from .command_text import command_hint, command_prefix
-from .database import Account, AccountLink, Binding, ChestRecord, ChestTask, Notice, Store, SynthesisRecord, new_id
+from .database import (
+    Account,
+    AccountLink,
+    Binding,
+    ChestRecord,
+    ChestTask,
+    Monitor,
+    Notice,
+    Store,
+    SynthesisRecord,
+    new_id,
+)
 from .diagnostics import Diagnostics, MeasuredLock, measure
 from .failures import Failures
 from .formatting import account_text, date_text, mask_cuid, remaining_text, task_text
@@ -153,6 +164,7 @@ class Service:
         self.diagnostics = Diagnostics()
         self._accounts: dict[str, asyncio.Lock] = {}
         self._users: dict[str, asyncio.Lock] = {}
+        self._monitors: dict[str, asyncio.Lock] = {}
         self._heavy_users: dict[str, str] = {}
         self._heavy_accounts: dict[str, str] = {}
         self._push_lock = asyncio.Lock()
@@ -285,6 +297,9 @@ class Service:
 
     def user_lock(self, key: str) -> asyncio.Lock:
         return self._users.setdefault(key, MeasuredLock("user-lock"))
+
+    def monitor_lock(self, key: str) -> asyncio.Lock:
+        return self._monitors.setdefault(key, MeasuredLock("monitor-lock"))
 
     @asynccontextmanager
     async def heavy_operation(
@@ -749,6 +764,177 @@ class Service:
             if enabled
             else "已关闭每满10次推送，改为任务结束汇总；中断时仍补发已有结果。"
         )
+
+    async def monitor_command(self, event: Event, argument: str) -> str:
+        owner = identity(event.bot_id, event.user_id)
+        async with self.user_lock(owner), self.monitor_lock(owner):
+            binding, account = await self.bound(event, allow_expired=True)
+            if not argument:
+                return await self.monitor_status(binding)
+            if argument in ("关闭", "取消"):
+                return await self.monitor_disable(binding)
+            name = argument.removeprefix("角色=").strip()
+            if not name:
+                raise WuwaError(
+                    command_hint("用法：wt监测 角色名；发送 wt监测 查看状态，发送 wt监测 关闭 可关闭。")
+                )
+            return await self.monitor_enable(event, binding, account, name)
+
+    async def monitor_status(self, binding: Binding) -> str:
+        row = await Store.monitor(binding.id)
+        if row is None or not row.enabled:
+            last = f"上次监测角色：{row.role_name}。" if row is not None and row.role_name else ""
+            return command_hint(f"当前账号未开启开箱监测。{last}发送 wt监测 角色名 可开启。")
+        async with self.account_lock(row.account_id):
+            now = time.time()
+            records = await Store.monitor_records(row.account_id, row.last_at, now)
+            summary = monitor.summarize(self.cards, records, monitor.parse_roles(row.role_ids))
+            sub = await Store.subscription(row.subscription_id)
+            route_ok = sub is not None and bool(sub.WS_BOT_ID)
+            watched = await Store.account(row.account_id)
+        target = (
+            f"CUID {mask_cuid(watched.cuid)}（{'国服' if watched.domestic else '海外'}）"
+            if watched is not None
+            else "账号数据缺失"
+        )
+        pending = f"待汇总：{summary.total} 件（{summary.kinds} 种）" if summary.total else "待汇总：暂无"
+        next_check = (row.checked_at or time.time()) + monitor.INTERVAL
+        lines = [
+            f"开箱监测：{row.role_name}",
+            f"监测账号：{target}",
+            pending,
+            f"汇报频率：每 {monitor.INTERVAL_HOURS} 小时",
+            f"上次汇总：{date_text(row.last_report_at) if row.last_report_at else '尚未'}",
+            f"下次检查：{date_text(next_check)}",
+            "通知路由：正常" if route_ok else command_hint("通知路由：已失效，请重新发送 wt监测 角色名 重建。"),
+            command_hint("发送 wt监测 关闭 可关闭。"),
+        ]
+        return "\n".join(lines)
+
+    async def monitor_enable(self, event: Event, binding: Binding, account: Account, name: str) -> str:
+        roles, role_name = self.cards.resolve_role(name)
+        async with self.account_lock(account.id):
+            now = time.time()
+            row = await Store.monitor(binding.id)
+            existed = row is not None
+            was_enabled = row is not None and row.enabled
+            target = row is not None and row.account_id == account.id
+            same = False
+            if row is not None and target:
+                same = monitor.parse_roles(row.role_ids) == roles
+            route_ok = False
+            if row is not None:
+                sub = await Store.subscription(row.subscription_id)
+                route_ok = sub is not None and bool(sub.WS_BOT_ID)
+            reset = row is None or not row.enabled or not same
+            cancelled = 0
+            if reset and was_enabled and route_ok and row is not None:
+                pending = await Store.notices(None, row.subscription_id)
+                if pending:
+                    await Store.mark_superseded([notice.id for notice in pending], "监测设置已更新")
+                    cancelled = len(pending)
+            if row is None:
+                row = Monitor(
+                    owner_id=binding.id,
+                    account_id=account.id,
+                    subscription_id=0,
+                    last_at=now,
+                    checked_at=now,
+                    created_at=now,
+                    updated_at=now,
+                )
+            row.account_id = account.id
+            row.role_ids = json.dumps(sorted(roles), separators=(",", ":"))
+            row.role_name = role_name
+            row.enabled = True
+            row.updated_at = now
+            if reset:
+                row.last_at = now
+                row.checked_at = now
+                row.last_report_at = 0
+            route_created = False
+            if route_ok:
+                await Store.save(row)
+            else:
+                async with self.subscription(event, monitor.SUBSCRIBE_NAME, new_id()) as subscription_id:
+                    row.subscription_id = subscription_id
+                    await Store.save(row)
+                route_created = True
+        if not existed:
+            message = (
+                f"已开启「{role_name}」开箱监测：只统计此后开到的该角色物品，"
+                f"每 {monitor.INTERVAL_HOURS} 小时汇总一次。"
+            )
+        elif not was_enabled:
+            message = f"已重新开启「{role_name}」开箱监测，从当前时间重新累计。"
+        elif not target:
+            message = f"已将开箱监测切换为当前账号的「{role_name}」，从当前时间重新累计。"
+        elif not same:
+            message = f"已将开箱监测角色改为「{role_name}」，从当前时间重新累计。"
+        else:
+            message = f"「{role_name}」开箱监测已在运行，每 {monitor.INTERVAL_HOURS} 小时汇总一次。"
+        if cancelled:
+            message += f"\n已作废 {cancelled} 条旧监测汇报。"
+        if route_created and existed:
+            message += "\n通知路由已重建。"
+        return message + command_hint("\n发送 wt监测 查看状态，发送 wt监测 关闭 可关闭。")
+
+    async def monitor_disable(self, binding: Binding) -> str:
+        row = await Store.monitor(binding.id)
+        if row is None or not row.enabled:
+            return command_hint("当前账号未开启开箱监测。发送 wt监测 角色名 可开启。")
+        async with self.account_lock(row.account_id):
+            if not await Store.disable_monitor(binding.id, time.time()):
+                return command_hint("开箱监测已关闭。")
+            name = row.role_name
+        return f"已关闭「{name}」开箱监测；尚未汇报的累计结果不再发送。"
+
+    async def monitor_reports(self) -> None:
+        """低频汇总：只读本地成功流水；通知与游标同事务，重启后不重复。"""
+        if self.closing or not self.database_ready:
+            return
+        for snapshot in await Store.due_monitors(time.time() - monitor.INTERVAL):
+            if self.closing:
+                return
+            owner, key = snapshot.owner_id, snapshot.account_id
+            fail_key = "monitor:" + owner
+            if self.monitor_lock(owner).locked() or self.account_lock(key).locked():
+                continue
+            if key in self._pending_opens:
+                # 已确认但尚未落盘的开箱回执可能早于游标，先补写再汇报，避免漏计。
+                continue
+            if not self.failures.cooldown_ready(fail_key):
+                continue
+            try:
+                async with self.monitor_lock(owner), self.account_lock(key):
+                    row = await Store.monitor(owner)
+                    now = time.time()
+                    if row is None or not row.enabled or row.account_id != key:
+                        continue
+                    if now - row.checked_at < monitor.INTERVAL:
+                        continue
+                    sub = await Store.subscription(row.subscription_id)
+                    if sub is None or not sub.WS_BOT_ID:
+                        # 路由失效时保留游标和流水，等用户重建路由后再汇报。
+                        continue
+                    records = await Store.monitor_records(key, row.last_at, now)
+                    summary = monitor.summarize(self.cards, records, monitor.parse_roles(row.role_ids))
+                    text = monitor.report_text(row.role_name, summary) if summary.total else None
+                    # 游标单调前进，避免时钟回拨或旧流水导致同一批结果再次汇总。
+                    finish_at = max(now, row.last_at)
+                    if records:
+                        finish_at = max(finish_at, records[-1].created_at)
+                    queued = await Store.finish_monitor_window(owner, key, row.last_at, text, finish_at)
+                    await self.failures.success(fail_key)
+                    if queued and text is not None:
+                        self.wake_notices()
+            except SQLAlchemyError as error:
+                await self.disable_database(error)
+                return
+            except Exception as error:
+                if self.failures.attempts(fail_key) == 0:
+                    logger.exception("[WuwaTappoUID] 开箱监测汇报出现意外错误")
+                await self.failures.fail(fail_key, "开箱监测汇报", self.error_detail(error), key)
 
     async def queue_results(self, key: str, *, force: bool = False, reason: str = "") -> None:
         """调用方持有账号锁；结果归入通知和 notice_id 在同一事务落库。"""
@@ -1854,6 +2040,7 @@ class Service:
                     await self.failures.fail(
                         "synthesis-save", "合成流水补写", self.error_detail(error), blocked_delay=300
                     )
+            await self.monitor_reports()
             for task in await Store.active_tasks():
                 if task.timer_paused:
                     continue

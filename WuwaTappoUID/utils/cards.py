@@ -394,13 +394,23 @@ class Cards:
         entry = self.catalog.get(str(item.asset_id))
         return str(entry.role) if entry is not None else "0"
 
-    def role_ids(self, name: str) -> set[str] | None:
-        if not name:
-            return None
+    def _role_table(self) -> dict[str, str]:
         roles = dict(self._bundled_roles)
         if self.resources.dictionary is not None:
             roles.update(self.resources.dictionary.character)
-        return resolve_roles(name, roles)
+        return roles
+
+    def role_ids(self, name: str) -> set[str] | None:
+        if not name:
+            return None
+        return resolve_roles(name, self._role_table())
+
+    def resolve_role(self, name: str) -> tuple[set[str], str]:
+        """返回监测使用的角色 ID 集合与角色目录中的完整名称。"""
+        roles = self._role_table()
+        ids = resolve_roles(name, roles, command="监测")
+        labels = {label for key, label in roles.items() if str(key) in ids and label}
+        return ids, "、".join(sorted(labels)) or name.strip()
 
     def in_scope(self, item: Item, rarity: str | None, roles: set[str] | None) -> bool:
         if rarity:

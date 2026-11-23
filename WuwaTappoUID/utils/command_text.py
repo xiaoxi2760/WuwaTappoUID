@@ -7,7 +7,7 @@ from gsuid_core.sv import get_plugin_available_prefix
 
 _COMMAND = re.compile(
     r"wt(?=强制更新资源|更新资源|开箱统计|添加token|增加次数|取消订阅|登录|查看|切换|删除|信息|次数|"
-    r"背包|图鉴|宝箱|暂停|恢复|停止|订阅|合成|兑换|帮助|状态)"
+    r"背包|图鉴|宝箱|监测|暂停|恢复|停止|订阅|合成|兑换|帮助|状态)"
 )
 current_prefix: ContextVar[str | None] = ContextVar("wt_command_prefix", default=None)
 
